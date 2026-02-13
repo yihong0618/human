@@ -1,0 +1,26 @@
+From 49d11e6f3e988e97d2572f43d500514b3e11c309 Mon Sep 17 00:00:00 2001
+From: yihong0618 <zouzou0208@gmail.com>
+Date: Fri, 13 Feb 2026 15:42:52 +0800
+Subject: [PATCH] fix: apply suggestions
+
+Signed-off-by: yihong0618 <zouzou0208@gmail.com>
+---
+ Lib/inspect.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Lib/inspect.py b/Lib/inspect.py
+index 808aef4195..d5fea5eae1 100644
+--- a/Lib/inspect.py
++++ b/Lib/inspect.py
+@@ -844,7 +844,7 @@ def getfile(object):
+         if getattr(object, '__file__', None):
+             return object.__file__
+         if getattr(object, '__spec__', None) is not None:
+-            raise TypeError(f'{object!r} is a built-in module')
++            raise TypeError(f'{object!r} is: {object.__spec__.origin}')
+         raise TypeError(f'cannot get source from {object!r}')
+     if isclass(object):
+         if hasattr(object, '__module__'):
+-- 
+2.49.0
+
