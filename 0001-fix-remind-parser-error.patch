@@ -1,0 +1,26 @@
+From 37f7a50f0ac3c1b69cabdc0b777ff756cb4e2e1a Mon Sep 17 00:00:00 2001
+From: yihong0618 <zouzou0208@gmail.com>
+Date: Fri, 13 Feb 2026 13:33:06 +0800
+Subject: [PATCH] fix: remind parser error
+
+Signed-off-by: yihong0618 <zouzou0208@gmail.com>
+---
+ handlers/remind.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/handlers/remind.py b/handlers/remind.py
+index e8ed5f4..170b5b3 100644
+--- a/handlers/remind.py
++++ b/handlers/remind.py
+@@ -404,7 +404,7 @@ def remind_command(message: Message, bot: TeleBot) -> None:
+     time_part = parts[1]
+     content = parts[2]
+ 
+-    reply = bot_reply_first(message, "...", bot)
++    reply = bot_reply_first(message, "好！", bot)
+     trigger_time = _parse_remind_time(time_part)
+ 
+     if not trigger_time:
+-- 
+2.49.0
+
