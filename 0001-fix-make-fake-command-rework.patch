@@ -1,0 +1,439 @@
+From 3d0f0ce2f3c53690c8b51bf1628b2f7fb3a5c9cf Mon Sep 17 00:00:00 2001
+From: yihong0618 <zouzou0208@gmail.com>
+Date: Fri, 13 Feb 2026 11:01:40 +0800
+Subject: [PATCH] fix: make fake command rework
+
+Signed-off-by: yihong0618 <zouzou0208@gmail.com>
+---
+ handlers/_utils.py       |  59 +++++++++++++++++++++
+ handlers/fake_liuneng.py | 111 ++++++++++++++++++++++++---------------
+ handlers/quote.py        |  59 +++------------------
+ tests/test_quote.py      |  19 ++++---
+ 4 files changed, 144 insertions(+), 104 deletions(-)
+
+diff --git a/handlers/_utils.py b/handlers/_utils.py
+index 508d5f4..b028706 100644
+--- a/handlers/_utils.py
++++ b/handlers/_utils.py
+@@ -5,6 +5,7 @@ import logging
+ import re
+ from functools import update_wrapper
+ from mimetypes import guess_type
++from pathlib import Path
+ from typing import Any, Callable, MutableMapping, TypeVar, cast
+ 
+ import requests
+@@ -15,6 +16,8 @@ from telebot.types import Message
+ from telebot.util import smart_split
+ from telegramify_markdown.customize import get_runtime_config
+ from urlextract import URLExtract
++from PIL import ImageFont
++import numpy as np
+ 
+ get_runtime_config().markdown_symbol.head_level_1 = (
+     "*"  # If you want, Customizing the head level 1 symbol
+@@ -296,3 +299,59 @@ def tool_status_message(tool_names: list[str]) -> str:
+         unique = list(dict.fromkeys(tool_names))
+         return "🔧 正在调用工具: " + ", ".join(unique) + "…"
+     return "\n".join(parts)
++
++
++def _font_candidates(bold: bool) -> list[str]:
++    if bold:
++        return [
++            "/System/Library/Fonts/Hiragino Sans GB.ttc",
++            "/System/Library/Fonts/STHeiti Medium.ttc",
++            "/System/Library/Fonts/PingFang.ttc",
++            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
++            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
++            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
++            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
++            "/usr/share/fonts/truetype/arphic/ukai.ttc",
++            "/usr/share/fonts/truetype/arphic/uming.ttc",
++            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
++            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
++        ]
++    return [
++        "/System/Library/Fonts/Hiragino Sans GB.ttc",
++        "/System/Library/Fonts/STHeiti Light.ttc",
++        "/System/Library/Fonts/PingFang.ttc",
++        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
++        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
++        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
++        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
++        "/usr/share/fonts/truetype/arphic/ukai.ttc",
++        "/usr/share/fonts/truetype/arphic/uming.ttc",
++        "/System/Library/Fonts/Supplemental/Arial.ttf",
++        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
++    ]
++
++
++def load_font(
++    size: int, *, bold: bool = False
++) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
++    for font_path in _font_candidates(bold):
++        path = Path(font_path)
++        if not path.exists():
++            continue
++        try:
++            return ImageFont.truetype(str(path), size=size)
++        except OSError:
++            continue
++    return ImageFont.load_default()
++
++
++def black_or_red(image):
++    try:
++        image = image.convert("L")
++        arr = np.array(image)
++        bottom_rows = arr[-10:, :]
++        avg = bottom_rows.mean()
++        return "red" if avg > 127 else "white"
++    except Exception as e:
++        logger.exception("Error determining image brightness: %s", e)
++        return "red"  # Default to red if there's an error
+diff --git a/handlers/fake_liuneng.py b/handlers/fake_liuneng.py
+index 95a2260..24de871 100644
+--- a/handlers/fake_liuneng.py
++++ b/handlers/fake_liuneng.py
+@@ -1,8 +1,15 @@
+ import random
+ import re
++import time
+ from os import listdir
+ 
+-from PIL import Image, ImageDraw, ImageFont
++from PIL import Image, ImageDraw
++from config import settings
++from ._utils import (
++    load_font,
++    black_or_red,
++    non_llm_handler,
++)  # black_or_red is used for determining text color
+ from telebot import TeleBot
+ from telebot.types import Message
+ 
+@@ -65,6 +72,7 @@ def extract_prompt(message: str, bot_name: str) -> str:
+ class ImageRenderer:
+     def __init__(self):
+         self.canvas_width = 512
++        self.client = settings.openai_client
+         self.quotes = [
+             "我敬佩两种人\n年轻时陪男人过苦日子的女人\n富裕时陪女人过好日子的男人",
+             "人生就像一杯茶\n不会苦一辈子\n但总会苦一阵子",
+@@ -76,60 +84,79 @@ class ImageRenderer:
+         ]
+ 
+     def render_image(self, image_path, text):
+-        image = Image.open(image_path)
+-        scale_factor = self.canvas_width / image.width
+-        scaled_height = int(image.height * scale_factor)
+-        line_height = 50
+-        font_size = 20
+-        image_line_height = int(line_height / scale_factor)
+-        lines = split_lines(text)
+-        canvas_height = scaled_height
+-        if len(lines) > 1:
+-            canvas_height += (len(lines) - 1) * line_height
+-
+-        canvas = Image.new("RGB", (self.canvas_width, canvas_height))
+-        canvas.paste(image.resize((self.canvas_width, scaled_height)))
+-
+-        draw = ImageDraw.Draw(canvas)
+-        # font = ImageFont.load_default()
+-        font = ImageFont.truetype("wqy-microhei.ttc", font_size)
+-
+-        for i, line in enumerate(lines):
+-            if i > 0:
+-                bottom_strip = image.crop(
+-                    (0, image.height - image_line_height, image.width, image.height)
++        with Image.open(image_path) as image:
++            black_or_white_color = black_or_red(image)
++            scale_factor = self.canvas_width / image.width
++            scaled_height = int(image.height * scale_factor)
++            line_height = 50
++            font_size = 20
++            image_line_height = int(line_height / scale_factor)
++            lines = split_lines(text)
++            canvas_height = scaled_height
++            if len(lines) > 1:
++                canvas_height += (len(lines) - 1) * line_height
++
++            canvas = Image.new("RGB", (self.canvas_width, canvas_height))
++            canvas.paste(image.resize((self.canvas_width, scaled_height)))
++
++            draw = ImageDraw.Draw(canvas)
++            # font = ImageFont.load_default()
++            font = load_font(font_size)
++
++            for i, line in enumerate(lines):
++                if i > 0:
++                    bottom_strip = image.crop(
++                        (0, image.height - image_line_height, image.width, image.height)
++                    )
++                    canvas.paste(
++                        bottom_strip.resize((self.canvas_width, line_height)),
++                        (0, scaled_height + (i - 1) * line_height),
++                    )
++
++                y = scaled_height + i * line_height - (line_height - font_size) // 2
++                draw.text(
++                    (self.canvas_width // 2, y),
++                    line,
++                    fill=black_or_white_color,
++                    font=font,
++                    anchor="mm",
++                    stroke_width=1,
++                    stroke_fill="black",
+                 )
+-                canvas.paste(
+-                    bottom_strip.resize((self.canvas_width, line_height)),
+-                    (0, scaled_height + (i - 1) * line_height),
+-                )
+-
+-            y = scaled_height + i * line_height - (line_height - font_size) // 2
+-            draw.text(
+-                (self.canvas_width // 2, y),
+-                line,
+-                fill="white",
+-                font=font,
+-                anchor="mm",
+-                stroke_width=2,
+-                stroke_fill="black",
+-            )
+ 
+-        return canvas
++            return canvas
+ 
+     def save_image(self, image, filename="fake.jpg"):
+         image.save(filename)
+ 
+     def get_random_quote(self):
++        seed = time.time()
++        random.seed(seed)
++        if random.random() < 0.5:
++            prompt = "".join(random.sample(self.quotes, 3))
++            r = self.client.chat.completions.create(
++                model=settings.openai_model,
++                messages=[
++                    {
++                        "role": "user",
++                        "content": f"你是个东北大叔，依照这个写一些段子每句话控制在 10 个字以内，不要包含 emoji, 请不要返回描述只返回句子，例子：{prompt}",
++                    }
++                ],
++                max_tokens=200,
++            )
++            choices = r.choices
++            if choices and choices[0].message and choices[0].message.content:
++                return choices[0].message.content.strip() or ""
++            return
+         return random.choice(self.quotes)
+ 
+ 
++@non_llm_handler
+ def fake_handler(message: Message, bot: TeleBot) -> None:
+     """ignore"""
+     if message.text is None:
+         return
+-    who = "LiuNeng"
+-    bot.reply_to(message, f"Generating {who}'s fake image")
++    bot.reply_to(message, "Generating fake image")
+     m = message.text.strip()
+     prompt = m.strip()
+     bot_username = bot.get_me().username or ""
+@@ -161,7 +188,7 @@ def fake_photo_handler(message: Message, bot: TeleBot) -> None:
+     s = s.replace("/fake", "").strip()
+     s = s.replace("fake:", "").strip()
+     prompt = s.strip()
+-    bot.reply_to(message, "Generating LiuNeng's fake image")
++    bot.reply_to(message, "Generating fake image")
+     # get the high quality picture.
+     if message.photo is None:
+         return
+diff --git a/handlers/quote.py b/handlers/quote.py
+index 4ffcbd1..009e14c 100644
+--- a/handlers/quote.py
++++ b/handlers/quote.py
+@@ -7,14 +7,13 @@ import unicodedata
+ import zoneinfo
+ from dataclasses import dataclass
+ from datetime import datetime, timezone
+-from pathlib import Path
+ from typing import Union
+ 
+ from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont, ImageOps
+ from telebot import TeleBot
+ from telebot.types import Message, PhotoSize
+ 
+-from ._utils import non_llm_handler
++from ._utils import non_llm_handler, load_font
+ from config import settings
+ 
+ CANVAS_SIZE = (1080, 1350)
+@@ -50,50 +49,6 @@ class QuotePayload:
+     avatar_image: Image.Image
+ 
+ 
+-def _font_candidates(bold: bool) -> list[str]:
+-    if bold:
+-        return [
+-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+-            "/System/Library/Fonts/STHeiti Medium.ttc",
+-            "/System/Library/Fonts/PingFang.ttc",
+-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+-            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
+-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+-            "/usr/share/fonts/truetype/arphic/ukai.ttc",
+-            "/usr/share/fonts/truetype/arphic/uming.ttc",
+-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+-        ]
+-    return [
+-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+-        "/System/Library/Fonts/STHeiti Light.ttc",
+-        "/System/Library/Fonts/PingFang.ttc",
+-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+-        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+-        "/usr/share/fonts/truetype/arphic/ukai.ttc",
+-        "/usr/share/fonts/truetype/arphic/uming.ttc",
+-        "/System/Library/Fonts/Supplemental/Arial.ttf",
+-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+-    ]
+-
+-
+-def _load_font(
+-    size: int, *, bold: bool = False
+-) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+-    for font_path in _font_candidates(bold):
+-        path = Path(font_path)
+-        if not path.exists():
+-            continue
+-        try:
+-            return ImageFont.truetype(str(path), size=size)
+-        except OSError:
+-            continue
+-    return ImageFont.load_default()
+-
+-
+ def _line_height(
+     font: ImageFont.FreeTypeFont | ImageFont.ImageFont, scale: float = 1.4
+ ) -> int:
+@@ -218,7 +173,7 @@ def _build_fallback_avatar(author_name: str, size: int = 256) -> Image.Image:
+     draw = ImageDraw.Draw(avatar)
+     initial = _pick_avatar_initial(author_name)
+     text_color = (255, 255, 255)
+-    font = _load_font(size // 2, bold=True)
++    font = load_font(size // 2, bold=True)
+     draw.text((size // 2, size // 2), initial, fill=text_color, font=font, anchor="mm")
+     return avatar
+ 
+@@ -564,11 +519,11 @@ def _compose_quote_image(payload: QuotePayload) -> Image.Image:
+     else:
+         quote_font_size = 38
+ 
+-    heading_font = _load_font(34, bold=True)
+-    quote_font = _load_font(quote_font_size, bold=False)
+-    quote_mark_font = _load_font(max(74, int(quote_font_size * 2.0)), bold=True)
+-    name_font = _load_font(44, bold=True)
+-    subtitle_font = _load_font(30, bold=False)
++    heading_font = load_font(34, bold=True)
++    quote_font = load_font(quote_font_size, bold=False)
++    quote_mark_font = load_font(max(74, int(quote_font_size * 2.0)), bold=True)
++    name_font = load_font(44, bold=True)
++    subtitle_font = load_font(30, bold=False)
+ 
+     temp_draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+     max_lines = (
+diff --git a/tests/test_quote.py b/tests/test_quote.py
+index 1accf85..a4cf53b 100644
+--- a/tests/test_quote.py
++++ b/tests/test_quote.py
+@@ -2,6 +2,7 @@
+ 
+ from unittest.mock import MagicMock, patch
+ from PIL import Image
++from handlers._utils import _font_candidates, load_font
+ from handlers.quote import (
+     _normalize_author_name,
+     _normalize_quote_text,
+@@ -10,8 +11,6 @@ from handlers.quote import (
+     _is_cjk,
+     _is_low_quality_author_name,
+     _normalize_for_render,
+-    _font_candidates,
+-    _load_font,
+     _line_height,
+     _extract_author,
+     _extract_message_date,
+@@ -235,17 +234,17 @@ class TestLoadFont:
+     """Tests for _load_font function."""
+ 
+     def test_returns_font_object(self):
+-        """Test _load_font always returns a usable font."""
++        """Test load_font always returns a usable font."""
+         from PIL import ImageFont
+ 
+-        font = _load_font(24)
++        font = load_font(24)
+         assert isinstance(font, (ImageFont.FreeTypeFont, ImageFont.ImageFont))
+ 
+     def test_bold_returns_font(self):
+         """Test _load_font bold returns a usable font."""
+         from PIL import ImageFont
+ 
+-        font = _load_font(24, bold=True)
++        font = load_font(24, bold=True)
+         assert isinstance(font, (ImageFont.FreeTypeFont, ImageFont.ImageFont))
+ 
+ 
+@@ -255,7 +254,7 @@ class TestLineHeight:
+     def test_returns_positive_int(self):
+         """Test line height is positive."""
+ 
+-        font = _load_font(24)
++        font = load_font(24)
+         result = _line_height(font)
+         assert isinstance(result, int)
+         assert result >= 36  # minimum enforced by function
+@@ -427,7 +426,7 @@ class TestWrapQuoteText:
+ 
+         img = Image.new("RGB", (1000, 100))
+         draw = ImageDraw.Draw(img)
+-        font = _load_font(24)
++        font = load_font(24)
+ 
+         lines = _wrap_quote_text("Hello world", draw, font, max_width=800, max_lines=5)
+         assert len(lines) >= 1
+@@ -439,7 +438,7 @@ class TestWrapQuoteText:
+ 
+         img = Image.new("RGB", (1000, 100))
+         draw = ImageDraw.Draw(img)
+-        font = _load_font(24)
++        font = load_font(24)
+ 
+         long_text = "A" * 500
+         lines = _wrap_quote_text(long_text, draw, font, max_width=200, max_lines=3)
+@@ -451,7 +450,7 @@ class TestWrapQuoteText:
+ 
+         img = Image.new("RGB", (1000, 100))
+         draw = ImageDraw.Draw(img)
+-        font = _load_font(24)
++        font = load_font(24)
+ 
+         lines = _wrap_quote_text("", draw, font, max_width=800, max_lines=5)
+         assert lines == []
+@@ -462,7 +461,7 @@ class TestWrapQuoteText:
+ 
+         img = Image.new("RGB", (1000, 100))
+         draw = ImageDraw.Draw(img)
+-        font = _load_font(24)
++        font = load_font(24)
+ 
+         lines = _wrap_quote_text(
+             "Line 1\n\nLine 3", draw, font, max_width=800, max_lines=10
+-- 
+2.49.0
+
